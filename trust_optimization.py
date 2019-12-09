@@ -1,6 +1,9 @@
 import torch
 import numpy as np
 import copy
+import json
+import matplotlib
+import matplotlib.pyplot as plt
 from tensorboardX import SummaryWriter
 
 class TrustRegionTester(object):
@@ -16,6 +19,8 @@ class TrustRegionTester(object):
     ETA_3 = 0.75
     M_1 = 0.25
     M_2 = 2.0
+    MAX_GAMMA = 10**10
+    MIN_GAMMA = 1
     
     DIM = 1 
 
@@ -23,6 +28,8 @@ class TrustRegionTester(object):
         # Generate Data
         self.train_data, self.val_data, self.test_data = self.generate_data()
         # self.train_data, self.val_data, self.test_data = self.load_data('data/housing_data.txt')
+
+        # self.find_dataset_distance()
 
         # Setup models
         self.trust_model = self.make_linear_regression() 
@@ -37,19 +44,77 @@ class TrustRegionTester(object):
         self.writer = SummaryWriter()
 
 
-        self.epochs = 10000
-        self.lr = 0.0001
+        self.epochs = 500
+        self.lr = 0.00000001
+
 
     def train(self):
         self.train_trust()
-        self.train_normal()
-    
+        # self.train_normal()
+
+    def graph_num_failures(self):
+        sample_ranges = [i+1 for i in range(1000)]
+        epochs_to_failure = []
+        validation_err = []
+        test_err = []
+        train_err = []
+        data_distance = []
+        for sample_range in sample_ranges:
+            self.train_data, self.val_data, self.test_data = self.generate_data(noise=sample_range)
+            epochs_to_failure.append(self.train_trust())
+            validation_err.append(self.test(self.trust_model, self.val_data))
+            test_err.append(self.test(self.trust_model, self.test_data))
+            train_err.append(self.test(self.trust_model, self.train_data))
+            data_distance.append(int(self.find_dataset_distance()[0]))
+
+        # print(data_distance)
+        # print(epochs_to_failure)
+        plt.scatter(data_distance, epochs_to_failure)
+        plt.show()
+        plt.scatter(sample_ranges, epochs_to_failure)
+        plt.show()
+
+        num_bins = 100
+        min_distance = min(data_distance)
+        max_distance = max(data_distance)
+        bin_size = float(max_distance - min_distance) / num_bins
+        print("bin_size: {}".format(bin_size))
+        bin_counts = [0 for i in range(num_bins + 1)]
+        bin_finished = [0 for i in range(num_bins + 1)]
+        for idx, distance in enumerate(data_distance):
+            bin = int((distance - min_distance)/ bin_size)
+            if bin >= len(bin_counts):
+                print("overshot bin!")
+                continue
+            bin_counts[bin]+= 1
+            if epochs_to_failure[idx] == 99:
+                bin_finished[bin] += 1
+        print("bin_finished: {}".format(bin_finished)) 
+        bin_pct_finished = []
+        for bin in range(num_bins + 1):
+            if bin_counts[bin] > 0:
+                bin_pct_finished.append(bin_finished[bin] / float(bin_counts[bin]))
+        print(bin_pct_finished)
+
+        plt.bar([i for i in range(len(bin_pct_finished))], bin_pct_finished)
+        plt.show()
+        
+    def test(self, model, dataset):
+        with torch.no_grad():
+            predictions = model(dataset[self.DATA_IDX])
+            error = self.loss_fn(predictions, dataset[self.GT_IDX])
+            return error.data
+        
+
     def evaluate(self):
+        self.find_dataset_distance()
         with torch.no_grad():
             for name, model in [("trust", self.trust_model), ("normal", self.model)]:
                 model.eval()
                 test_predictions = model(self.test_data[self.DATA_IDX])
                 loss = self.loss_fn(test_predictions, self.test_data[self.GT_IDX])
+                val_loss = self.test(model, self.val_data)
+                print("validation for {}: {}".format(name, val_loss.data))
                 print("evaluation for {}: {}".format(name, loss.data))
 
     def load_data(self, data_path):
@@ -81,8 +146,34 @@ class TrustRegionTester(object):
                (data_tensor[test_start: test_start + test_size], gt_tensor[test_start: test_start + test_size]))
         
 
+    def find_dataset_distance(self):
+        total_distance = 0
+        print(self.val_data[self.DATA_IDX].shape)
+        for val_idx in range(len(self.val_data[self.DATA_IDX])):
+            min_distance = 10**10
+            for train_idx in range(len(self.train_data[self.DATA_IDX])):
+                data_dist = (self.val_data[self.DATA_IDX][val_idx] - self.train_data[self.DATA_IDX][train_idx])**2
+                label_dist = (self.val_data[self.GT_IDX][val_idx] - self.train_data[self.GT_IDX][train_idx])**2
+                dist = (data_dist + label_dist)**(1/2.0)
+                if dist < min_distance:
+                    min_distance = dist
+            total_distance += min_distance
+        print("dataset distance: {}".format(total_distance))
+        return total_distance
 
-    def generate_data(self, degree=1, noise=0.0, num_samples=500):
+    def find_dataset_distance_2(self):
+        total_distance = 0
+        print(self.val_data[self.DATA_IDX].shape)
+        for val_idx in range(len(self.val_data[self.DATA_IDX])):
+            smallest_angle = 10**10
+            for train_idx in range(len(self.train_data[self.DATA_IDX])):
+                train_vector = (self.val_data[self.DATA_IDX][val_idx] - self.train_data[self.DATA_IDX][train_idx])**2
+                label_dist = (self.val_data[self.GT_IDX][val_idx] - self.train_data[self.GT_IDX][train_idx])**2
+                dist = (data_dist + label_dist)**(1/2.0)
+                if dist < min_distance:
+                    min_distance = dist
+
+    def generate_data(self, degree=1, noise=0.0, num_samples=100, range = 100):
         """For now just generate data in a single line with no noise.""" 
         # Sample x's uniformly at random from [-100, 100].
         train_size = int(num_samples * self.TRAIN_PCT)
@@ -90,7 +181,7 @@ class TrustRegionTester(object):
         test_size = int(num_samples * self.TEST_PCT)
 
         # Randomly Generate data.
-        x_values = torch.Tensor(np.random.randint(-100, 100, (num_samples, self.DIM)))
+        x_values = torch.Tensor(np.random.randint(-range, range, (num_samples, self.DIM)))
         weights = torch.Tensor(np.random.randint(-10, 10, (self.DIM, 1)))
         bias = torch.Tensor(np.random.randint(-100, 100, 1))
         print("weights: {}   biases: {}".format(weights, bias))
@@ -100,8 +191,9 @@ class TrustRegionTester(object):
 
         # Add noise.
         y_values = y_values + torch.Tensor(np.random.normal(noise, 0, y_values.shape))
-        x_values = x_values
         test_start = train_size + val_size
+        # print("x_values: {}".format(x_values))
+        # print("y_values: {}".format(y_values))
 
         return ((x_values[:train_size], y_values[:train_size]),
                (x_values[train_size:train_size + val_size], y_values[train_size:train_size + val_size]),
@@ -109,58 +201,75 @@ class TrustRegionTester(object):
 
     def gd_fn_approximation(self, grad, gamma):
         d = self.d(grad, gamma)
-        return -(torch.mm(grad, torch.t(d)) + torch.mm(d, torch.t(d)))
+        if len(grad.shape) > 1:
+            return -(torch.mm(grad, torch.t(d)) + torch.mm(d, torch.t(d)))
+        return -(grad * d + d * d)
     
     def d(self, grad, gamma):
         return -float(1 / float(1 + gamma)) *  grad
 
     def train_trust(self):
         gamma = 1
-        last_val_error = self.run_validation(self.trust_model)
+        last_val_error, grad = self.run_validation(self.trust_model)
         for epoch in range(self.epochs):
             # print("--- Iteration {} ---".format(epoch))
             predictions = self.trust_model(self.train_data[self.DATA_IDX])
             error = self.loss_fn(predictions, self.train_data[self.GT_IDX])
             self.trust_model.zero_grad()
+
             self.writer.add_scalar("trust_region/train", error.data, epoch)
             error.backward()
 
+            prev_weights = []
+            prev_grads = []
+            approx_decrease = 0
             # Temporarily Take a Step
-            prev_grad = self.trust_model.weight.grad.clone()
-            prev_bias_grad = self.trust_model.bias.grad.clone()
-            prev_weights = self.trust_model.weight.clone()
-            prev_bias = self.trust_model.bias.clone()
-            self.trust_model.weight = torch.nn.Parameter(self.trust_model.weight + self.d(prev_grad, gamma))
-            self.trust_model.bias = torch.nn.Parameter(self.trust_model.bias + self.d(prev_bias_grad, gamma))
+            for w in self.trust_model.parameters():
+                prev_weights.append(w.data.clone())
+                prev_grads.append(w.grad.data.clone())
+                w.data = w.data + self.d(w.grad.data, gamma)
+                approx_decrease += self.gd_fn_approximation(w.grad, gamma)
 
-            val_error = self.run_validation(self.trust_model)
+            val_error, val_grads = self.run_validation(self.trust_model)
+            
+            grad_prod = 0
+            for i, prev_grad in enumerate(prev_grads):
+                grad_prod += prev_grad * val_grads[i]
+            
+            self.writer.add_scalar("trust_region/grad_prod", grad_prod, epoch)
 
             self.writer.add_scalar("trust_region/val", val_error, epoch)
 
             c_numerator = (last_val_error - val_error)
-            # self.writer.add_scalar("trust_region/val_diff", c_numerator, epoch)
+            self.writer.add_scalar("trust_region/fn_true", c_numerator, epoch)
 
             # Validation Error Increased, and will be stuck
             if c_numerator < 0:
                 print("Validation Increased!")
 
-
-            approx = float(self.gd_fn_approximation(prev_grad, gamma))
-            c =  c_numerator / approx
+            c =  c_numerator / approx_decrease
+            self.writer.add_scalar("trust_region/c", c, epoch)
+            self.writer.add_scalar("trust_region/fn_approximation", approx_decrease, epoch)
             # print("validation_diff: {}  estimation: {} gamma: {} gdfn_approx: {} prev_grad: {}".format(c_numerator, c, gamma, approx, prev_grad))
             if c < self.ETA_1:  # Step is too large, Abort.
-                #print("c too small, aborting...")
-                self.trust_model.weight = torch.nn.Parameter(prev_weights)
-                self.trust_model.bias = torch.nn.Parameter(prev_bias)
+                # print("c too small, aborting...")
+                for idx, w in enumerate(self.trust_model.parameters()):
+                    w.data = prev_weights[idx]
+                gamma /= self.M_1
+                gamma = min(gamma, self.MAX_GAMMA)
+                if gamma == self.MAX_GAMMA:
+                    print("Epochs to Failure: {}".format(epoch))
+                    return epoch
             else:
                 last_val_error = val_error
                 
 
-            if c < self.ETA_2:
-                gamma /= self.M_1
-            elif c > self.ETA_3:
+            if c > self.ETA_3:
                 gamma /= self.M_2 
+                gamma = max(gamma, self.MIN_GAMMA)
             self.writer.add_scalar("trust_region/gamma", gamma, epoch)
+        print("Epochs to Failure: {}".format(epoch))
+        return epoch
 
     def train_normal(self):
         top_validation = 10**10
@@ -183,13 +292,38 @@ class TrustRegionTester(object):
         print("top normal model validation: {}".format(top_validation))
     
     def train_joint(self):
-        pass
+        top_validation = 10**10
+        top_model = None
+        data = torch.cat([self.train_data[self.DATA_IDX], self.val_data[self.DATA_IDX]], axis=0)
+        gt = torch.cat([self.train_data[self.GT_IDX], self.val_data[self.GT_IDX]], axis=0)
+        for epoch in range(self.epochs):
+            predictions = self.joint_model(data)
+            error = self.loss_fn(predictions, gt)
+            self.writer.add_scalar("normal/train", error.data, epoch)
+            self.model.zero_grad()
+            error.backward()
+            for w in self.model.parameters():
+                w.data = w.data - self.lr * w.grad.data
+
+            val_error = self.run_validation(self.model)
+            self.writer.add_scalar("normal/val", val_error, epoch)
+            if val_error < top_validation:
+                top_validation = val_error
+                top_model = self.model
+        self.model = top_model
+        print("top normal model validation: {}".format(top_validation))
 
     def run_validation(self, model):
-        with torch.no_grad():
-            predictions = model(self.val_data[self.DATA_IDX])
-            error = self.loss_fn(predictions, self.val_data[self.GT_IDX])
-            return error.data
+        model.zero_grad()
+        predictions = model(self.val_data[self.DATA_IDX])
+        error = self.loss_fn(predictions, self.val_data[self.GT_IDX])
+        error.backward()
+        val_grads = []
+        for w in model.parameters():
+            val_grad = w.grad.data.clone()
+            val_grads.append(val_grad)
+        model.zero_grad()
+        return error.data, val_grads
 
     def make_linear_regression(self, output_dim=1):
         return torch.nn.Linear(self.DIM, output_dim)
@@ -216,5 +350,6 @@ class MLP(torch.nn.Module):
 
 if __name__ == "__main__":
     trust_tester = TrustRegionTester()
+    #trust_tester.graph_num_failures()
     trust_tester.train()
     trust_tester.evaluate()
