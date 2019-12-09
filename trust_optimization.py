@@ -53,30 +53,33 @@ class TrustRegionTester(object):
         # self.train_normal()
 
     def graph_num_failures(self):
-        sample_ranges = [i / 4.0 for i in range(20)]
+        sample_ranges = [i+1 for i in range(100)]
         num_trials = 20
         epochs_to_failure = []
         validation_err = []
         test_err = []
         train_err = []
         data_distance = []
+        data_distance_2 = []
         for sample_range in sample_ranges:
             for _ in range(num_trials):
-                self.train_data, self.val_data, self.test_data = self.generate_data(noise=sample_range)
+                self.train_data, self.val_data, self.test_data = self.generate_data(range=sample_range)
                 epochs_to_failure.append(self.train_trust())
                 validation_err.append(self.test(self.trust_model, self.val_data))
                 test_err.append(self.test(self.trust_model, self.test_data))
                 train_err.append(self.test(self.trust_model, self.train_data))
-                data_distance.append(int(self.find_dataset_distance()[0]))
+                data_distance.append(float(self.find_dataset_distance()[0]))
+                data_distance_2.append(float(self.find_dataset_distance_2()[0]))
 
         # print(data_distance)
         # print(epochs_to_failure)
-        """
-        plt.scatter(data_distance, epochs_to_failure)
+        plt.scatter(data_distance_2, epochs_to_failure)
         plt.show()
+        """
         plt.scatter(sample_ranges, epochs_to_failure)
         plt.show()
         """
+        self.make_bar_graph(50, data_distance_2, epochs_to_failure, self.epochs -1, "Distance 2 Between Validation and Training")
         self.make_bar_graph(50, data_distance, epochs_to_failure, self.epochs - 1, "Distance Between Validation and Training")
         # self.make_bar_graph(50, sample_ranges, epochs_to_failure, self.epochs - 1, "Data Range")
     
@@ -100,7 +103,6 @@ class TrustRegionTester(object):
                 bin_finished[bin] += 1
 
         print("bin_finished: {}".format(bin_finished)) 
-        print("bin_counts: {}".format(bin_counts))
         bin_pct_finished = []
         for bin in range(num_bins + 1):
             if bin_counts[bin] > 0:
@@ -110,7 +112,6 @@ class TrustRegionTester(object):
         # tick_labels = [int(min_val + i * bin_size) for i in range(len(bin_finished))]
         plt.bar([i for i in range(len(bin_finished))], bin_finished) #, tick_label=tick_labels)
         plt.xlabel(x_label)
-
         plt.ylabel("Pct {} training steps completed".format(self.epochs))
         plt.show()
 
@@ -172,24 +173,37 @@ class TrustRegionTester(object):
         print(self.val_data[self.DATA_IDX].shape)
         for val_idx in range(len(self.val_data[self.DATA_IDX])):
             min_distance = 10**10
+            for train_idx in range(len(self.train_data[self.DATA_IDX])):
+                data_dist = (self.val_data[self.DATA_IDX][val_idx] - self.train_data[self.DATA_IDX][train_idx])
+                data_dist = data_dist.dot(data_dist)
+                label_dist = 0 #(self.val_data[self.GT_IDX][val_idx] - self.train_data[self.GT_IDX][train_idx])**2
+                dist = (data_dist + label_dist)**(1/2.0)
+                if dist < min_distance:
+                    min_distance = dist
+            total_distance += min_distance
+        print("dataset distance: {}".format(total_distance))
+        return [total_distance]
+
+    def find_dataset_distance_2(self):
+        total_distance = 0
+        print(self.val_data[self.DATA_IDX].shape)
+        for val_idx in range(len(self.val_data[self.DATA_IDX])):
+            min_distance = 10**10
             true_distance = 10**10
             for train_idx in range(len(self.train_data[self.DATA_IDX])):
                 data_dist = (self.val_data[self.DATA_IDX][val_idx] - self.train_data[self.DATA_IDX][train_idx])
                 data_dist = data_dist.dot(data_dist)
-
                 label_dist = (self.val_data[self.GT_IDX][val_idx] - self.train_data[self.GT_IDX][train_idx])**2
 
                 dist = label_dist / float(data_dist + 0.000001)
-                # Find closest data point
                 if data_dist < min_distance:
                     min_distance = data_dist
                     true_distance = dist
             total_distance += true_distance
         print("dataset distance: {}".format(total_distance))
-        return total_distance
+        return [total_distance]
 
-
-    def generate_data(self, degree=1, noise=0.0, num_samples=100, range=1):
+    def generate_data(self, degree=1, noise=0.0, num_samples=100, range=100):
         """For now just generate data in a single line with no noise.""" 
         # Sample x's uniformly at random from [-100, 100].
         train_size = int(num_samples * self.TRAIN_PCT)
@@ -227,8 +241,11 @@ class TrustRegionTester(object):
     def train_trust(self):
         gamma = 1
         last_val_error, grad = self.run_validation(self.trust_model)
+        steps_taken = 0
+        steps_until_negative_grad_prod = 0
+        grad_prod_negative = False
         for epoch in range(self.epochs):
-            # print("--- Iteration {} ---".format(epoch))
+            print("--- Iteration {} ---".format(epoch))
             predictions = self.trust_model(self.train_data[self.DATA_IDX])
             error = self.loss_fn(predictions, self.train_data[self.GT_IDX])
             self.trust_model.zero_grad()
@@ -239,13 +256,14 @@ class TrustRegionTester(object):
             prev_weights = []
             prev_grads = []
             approx_decrease = 0
-            # Temporarily Take a Step
+
             for w in self.trust_model.parameters():
                 prev_weights.append(w.data.clone())
                 prev_grads.append(w.grad.data.clone())
-                w.data = w.data + self.d(w.grad.data, gamma)
-                approx_decrease += self.gd_fn_approximation(w.grad, gamma)
-
+                # w.data = w.data + self.d(w.grad.data, gamma) 
+                # approx_decrease += self.gd_fn_approximation(w.grad, gamma)
+            
+            # To get the gradient of the ORIGINAL model with respect to the validation set
             val_error, val_grads = self.run_validation(self.trust_model)
             
             grad_prod = 0
@@ -254,10 +272,25 @@ class TrustRegionTester(object):
                     grad_prod += torch.mm(prev_grad, torch.t(val_grads[i]))
                 else: 
                     grad_prod += prev_grad * val_grads[i]
-            
+
             self.writer.add_scalar("trust_region/grad_prod", grad_prod, epoch)
-            #if grad_prod < 0:
-            #    print("negative grad_prod!")
+            print("grad_prod: {}".format(grad_prod))
+            if grad_prod < 0:
+                print("negative grad_prod!")
+                grad_prod_negative = True
+
+            if not grad_prod_negative:
+                steps_until_negative_grad_prod += 1
+
+            # Temporarily Take a Step
+            for i, w in enumerate(self.trust_model.parameters()):
+                prev_weights.append(w.data.clone())
+                prev_grads.append(w.grad.data.clone())
+                w.data = w.data + self.d(prev_grads[i], gamma) 
+                approx_decrease += self.gd_fn_approximation(prev_grads[i], gamma)
+
+            # Check validation on the new step
+            val_error, _ = self.run_validation(self.trust_model)
 
             self.writer.add_scalar("trust_region/val", val_error, epoch)
 
@@ -272,25 +305,27 @@ class TrustRegionTester(object):
             self.writer.add_scalar("trust_region/c", c, epoch)
             self.writer.add_scalar("trust_region/fn_approximation", approx_decrease, epoch)
             # print("validation_diff: {}  estimation: {} gamma: {} gdfn_approx: {} prev_grad: {}".format(c_numerator, c, gamma, approx, prev_grad))
-            if c < self.ETA_1:  # Step is too large, Abort.
+            if c < 0:  # Step is too large, Abort.
                 # print("c too small, aborting...")
                 for idx, w in enumerate(self.trust_model.parameters()):
                     w.data = prev_weights[idx]
                 gamma /= self.M_1
                 gamma = min(gamma, self.MAX_GAMMA)
                 if gamma == self.MAX_GAMMA:
-                    print("Epochs to Failure: {}".format(epoch))
-                    return epoch
+                    print("Epochs to Failure: {} Epochs to negative gradient: {}".format(steps_taken, steps_until_negative_grad_prod))
+                    return steps_taken 
             else:
                 last_val_error = val_error
+                steps_taken += 1
+                print("step taken")
                 
 
             if c > self.ETA_3:
                 gamma /= self.M_2 
                 gamma = max(gamma, self.MIN_GAMMA)
-            self.writer.add_scalar("trust_region/gamma", gamma, epoch)
-        print("Epochs to Failure: {}".format(epoch))
-        return epoch
+            self.writer.add_scalar("trust_region/gamma", gamma, steps_taken)
+        print("Epochs to Failure: {} Epochs to negative gradient: {}".format(steps_taken, steps_until_negative_grad_prod))
+        return steps_taken 
 
     def train_normal(self):
         top_validation = 10**10
@@ -347,7 +382,10 @@ class TrustRegionTester(object):
         return error.data, val_grads
 
     def make_linear_regression(self, output_dim=1):
-        return torch.nn.Linear(self.DIM, output_dim)
+        layer = torch.nn.Linear(self.DIM, output_dim)
+        torch.nn.init.constant_(layer.weight, 0)
+        torch.nn.init.constant_(layer.bias , 0)
+        return layer
 
     def make_mlp(self, hidden_dims=[300, 200, 100]):
         return MLP(self.DIM, hidden_dims)
@@ -371,6 +409,6 @@ class MLP(torch.nn.Module):
 
 if __name__ == "__main__":
     trust_tester = TrustRegionTester()
-    trust_tester.graph_num_failures()
-    # trust_tester.train()
-    # trust_tester.evaluate()
+    # trust_tester.graph_num_failures()
+    trust_tester.train()
+    trust_tester.evaluate()
