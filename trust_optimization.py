@@ -19,10 +19,10 @@ class TrustRegionTester(object):
     ETA_3 = 0.75
     M_1 = 0.25
     M_2 = 2.0
-    MAX_GAMMA = 10**10
+    MAX_GAMMA = 10**8
     MIN_GAMMA = 1
     
-    DIM = 1 
+    DIM = 10
 
     def __init__(self):
         # Generate Data
@@ -53,52 +53,73 @@ class TrustRegionTester(object):
         # self.train_normal()
 
     def graph_num_failures(self):
-        sample_ranges = [i+1 for i in range(1000)]
+        sample_ranges = [i / 4.0 for i in range(20)]
+        num_trials = 20
         epochs_to_failure = []
         validation_err = []
         test_err = []
         train_err = []
         data_distance = []
         for sample_range in sample_ranges:
-            self.train_data, self.val_data, self.test_data = self.generate_data(noise=sample_range)
-            epochs_to_failure.append(self.train_trust())
-            validation_err.append(self.test(self.trust_model, self.val_data))
-            test_err.append(self.test(self.trust_model, self.test_data))
-            train_err.append(self.test(self.trust_model, self.train_data))
-            data_distance.append(int(self.find_dataset_distance()[0]))
+            for _ in range(num_trials):
+                self.train_data, self.val_data, self.test_data = self.generate_data(noise=sample_range)
+                epochs_to_failure.append(self.train_trust())
+                validation_err.append(self.test(self.trust_model, self.val_data))
+                test_err.append(self.test(self.trust_model, self.test_data))
+                train_err.append(self.test(self.trust_model, self.train_data))
+                data_distance.append(int(self.find_dataset_distance()[0]))
 
         # print(data_distance)
         # print(epochs_to_failure)
+        """
         plt.scatter(data_distance, epochs_to_failure)
         plt.show()
         plt.scatter(sample_ranges, epochs_to_failure)
         plt.show()
-
-        num_bins = 100
-        min_distance = min(data_distance)
-        max_distance = max(data_distance)
-        bin_size = float(max_distance - min_distance) / num_bins
+        """
+        self.make_bar_graph(50, data_distance, epochs_to_failure, self.epochs - 1, "Distance Between Validation and Training")
+        # self.make_bar_graph(50, sample_ranges, epochs_to_failure, self.epochs - 1, "Data Range")
+    
+    def make_bar_graph(self, num_bins, bin_list, y_list, good_y_thresh, x_label):
+        min_val = min(bin_list)
+        max_val = max(bin_list)
+        bin_size = float(max_val- min_val) / num_bins
         print("bin_size: {}".format(bin_size))
         bin_counts = [0 for i in range(num_bins + 1)]
         bin_finished = [0 for i in range(num_bins + 1)]
-        for idx, distance in enumerate(data_distance):
-            bin = int((distance - min_distance)/ bin_size)
+        avg_bin = [0 for i in range(num_bins + 1)]
+
+        for idx, value in enumerate(bin_list):
+            bin = int((value - min_val)/ bin_size)
             if bin >= len(bin_counts):
                 print("overshot bin!")
                 continue
             bin_counts[bin]+= 1
-            if epochs_to_failure[idx] == 99:
+            avg_bin[bin] += y_list[idx]
+            if y_list[idx] == good_y_thresh:
                 bin_finished[bin] += 1
+
         print("bin_finished: {}".format(bin_finished)) 
+        print("bin_counts: {}".format(bin_counts))
         bin_pct_finished = []
         for bin in range(num_bins + 1):
             if bin_counts[bin] > 0:
-                bin_pct_finished.append(bin_finished[bin] / float(bin_counts[bin]))
-        print(bin_pct_finished)
+                bin_finished[bin] /= float(bin_counts[bin])
+                avg_bin[bin] /= float(bin_counts[bin])
 
-        plt.bar([i for i in range(len(bin_pct_finished))], bin_pct_finished)
+        # tick_labels = [int(min_val + i * bin_size) for i in range(len(bin_finished))]
+        plt.bar([i for i in range(len(bin_finished))], bin_finished) #, tick_label=tick_labels)
+        plt.xlabel(x_label)
+
+        plt.ylabel("Pct {} training steps completed".format(self.epochs))
         plt.show()
-        
+
+        tick_labels = [min_val + i * bin_size for i in range(len(avg_bin))]
+        plt.bar([i for i in range(len(avg_bin))], avg_bin) # , tick_label=tick_labels)
+        plt.xlabel(x_label)
+        plt.ylabel("Average number of training steps completed".format(self.epochs))
+        plt.show()
+
     def test(self, model, dataset):
         with torch.no_grad():
             predictions = model(dataset[self.DATA_IDX])
@@ -151,29 +172,24 @@ class TrustRegionTester(object):
         print(self.val_data[self.DATA_IDX].shape)
         for val_idx in range(len(self.val_data[self.DATA_IDX])):
             min_distance = 10**10
+            true_distance = 10**10
             for train_idx in range(len(self.train_data[self.DATA_IDX])):
-                data_dist = (self.val_data[self.DATA_IDX][val_idx] - self.train_data[self.DATA_IDX][train_idx])**2
+                data_dist = (self.val_data[self.DATA_IDX][val_idx] - self.train_data[self.DATA_IDX][train_idx])
+                data_dist = data_dist.dot(data_dist)
+
                 label_dist = (self.val_data[self.GT_IDX][val_idx] - self.train_data[self.GT_IDX][train_idx])**2
-                dist = (data_dist + label_dist)**(1/2.0)
-                if dist < min_distance:
-                    min_distance = dist
-            total_distance += min_distance
+
+                dist = label_dist / float(data_dist + 0.000001)
+                # Find closest data point
+                if data_dist < min_distance:
+                    min_distance = data_dist
+                    true_distance = dist
+            total_distance += true_distance
         print("dataset distance: {}".format(total_distance))
         return total_distance
 
-    def find_dataset_distance_2(self):
-        total_distance = 0
-        print(self.val_data[self.DATA_IDX].shape)
-        for val_idx in range(len(self.val_data[self.DATA_IDX])):
-            smallest_angle = 10**10
-            for train_idx in range(len(self.train_data[self.DATA_IDX])):
-                train_vector = (self.val_data[self.DATA_IDX][val_idx] - self.train_data[self.DATA_IDX][train_idx])**2
-                label_dist = (self.val_data[self.GT_IDX][val_idx] - self.train_data[self.GT_IDX][train_idx])**2
-                dist = (data_dist + label_dist)**(1/2.0)
-                if dist < min_distance:
-                    min_distance = dist
 
-    def generate_data(self, degree=1, noise=0.0, num_samples=100, range = 100):
+    def generate_data(self, degree=1, noise=0.0, num_samples=100, range=1):
         """For now just generate data in a single line with no noise.""" 
         # Sample x's uniformly at random from [-100, 100].
         train_size = int(num_samples * self.TRAIN_PCT)
@@ -234,9 +250,14 @@ class TrustRegionTester(object):
             
             grad_prod = 0
             for i, prev_grad in enumerate(prev_grads):
-                grad_prod += prev_grad * val_grads[i]
+                if len(prev_grad.shape) > 1:
+                    grad_prod += torch.mm(prev_grad, torch.t(val_grads[i]))
+                else: 
+                    grad_prod += prev_grad * val_grads[i]
             
             self.writer.add_scalar("trust_region/grad_prod", grad_prod, epoch)
+            #if grad_prod < 0:
+            #    print("negative grad_prod!")
 
             self.writer.add_scalar("trust_region/val", val_error, epoch)
 
@@ -350,6 +371,6 @@ class MLP(torch.nn.Module):
 
 if __name__ == "__main__":
     trust_tester = TrustRegionTester()
-    #trust_tester.graph_num_failures()
-    trust_tester.train()
-    trust_tester.evaluate()
+    trust_tester.graph_num_failures()
+    # trust_tester.train()
+    # trust_tester.evaluate()
