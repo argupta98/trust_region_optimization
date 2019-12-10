@@ -23,6 +23,7 @@ class TrustRegionTester(object):
     MIN_GAMMA = 1
     
     DIM = 10
+    STOP_THRESH = 0.001
 
     def __init__(self):
         # Generate Data
@@ -44,13 +45,33 @@ class TrustRegionTester(object):
         self.writer = SummaryWriter()
 
 
-        self.epochs = 500
-        self.lr = 0.00000001
+        self.epochs = 100000
+        self.lr = 0.0001
 
 
     def train(self):
-        self.train_trust()
-        # self.train_normal()
+        # Run 100 Trials
+        model_names = ["trust", "normal", "joint"]
+        out_dict = {name: np.zeros(5) for name in model_names}
+        num_iterations = 100 
+        for _ in range(num_iterations):
+            # Setup
+            self.train_data, self.val_data, self.test_data = self.generate_data()
+            self.trust_model = self.make_linear_regression() 
+            self.model = self.make_linear_regression()
+            self.joint_model = self.make_linear_regression()
+            self.model.load_state_dict(copy.deepcopy(self.trust_model.state_dict()))
+            self.joint_model.load_state_dict(copy.deepcopy(self.trust_model.state_dict()))
+
+            out_dict["trust"][0] += self.train_trust()
+            out_dict["normal"][0] += self.train_normal()
+            out_dict["joint"][0] += self.train_joint()
+            update_dict = self.evaluate()
+            for key in out_dict:
+                out_dict[key][1:] += update_dict[key]
+        for key in out_dict:
+            out_dict[key] /= float(num_iterations)
+        print(out_dict)
 
     def graph_num_failures(self):
         sample_ranges = [i+1 for i in range(100)]
@@ -130,14 +151,15 @@ class TrustRegionTester(object):
 
     def evaluate(self):
         self.find_dataset_distance()
-        with torch.no_grad():
-            for name, model in [("trust", self.trust_model), ("normal", self.model)]:
-                model.eval()
-                test_predictions = model(self.test_data[self.DATA_IDX])
-                loss = self.loss_fn(test_predictions, self.test_data[self.GT_IDX])
-                val_loss = self.test(model, self.val_data)
-                print("validation for {}: {}".format(name, val_loss.data))
-                print("evaluation for {}: {}".format(name, loss.data))
+        out_dict = {}
+        for name, model in [("trust", self.trust_model), ("normal", self.model), ("joint", self.joint_model)]:
+            train_loss = self.test(model, self.train_data)
+            val_loss = self.test(model, self.val_data)
+            test_loss = self.test(model, self.test_data)
+            val_test_diff =  (test_loss - val_loss)/ float(val_loss)
+            out_dict[name] = np.array([train_loss, val_loss, test_loss, val_test_diff])
+        return out_dict
+
 
     def load_data(self, data_path):
         with open(data_path, 'r') as fp:
@@ -248,6 +270,8 @@ class TrustRegionTester(object):
             print("--- Iteration {} ---".format(epoch))
             predictions = self.trust_model(self.train_data[self.DATA_IDX])
             error = self.loss_fn(predictions, self.train_data[self.GT_IDX])
+            if error.data < self.STOP_THRESH:
+                return epoch
             self.trust_model.zero_grad()
 
             self.writer.add_scalar("trust_region/train", error.data, epoch)
@@ -278,14 +302,13 @@ class TrustRegionTester(object):
             if grad_prod < 0:
                 print("negative grad_prod!")
                 grad_prod_negative = True
+                return epoch
 
             if not grad_prod_negative:
                 steps_until_negative_grad_prod += 1
 
             # Temporarily Take a Step
             for i, w in enumerate(self.trust_model.parameters()):
-                prev_weights.append(w.data.clone())
-                prev_grads.append(w.grad.data.clone())
                 w.data = w.data + self.d(prev_grads[i], gamma) 
                 approx_decrease += self.gd_fn_approximation(prev_grads[i], gamma)
 
@@ -305,15 +328,15 @@ class TrustRegionTester(object):
             self.writer.add_scalar("trust_region/c", c, epoch)
             self.writer.add_scalar("trust_region/fn_approximation", approx_decrease, epoch)
             # print("validation_diff: {}  estimation: {} gamma: {} gdfn_approx: {} prev_grad: {}".format(c_numerator, c, gamma, approx, prev_grad))
-            if c < 0:  # Step is too large, Abort.
+            if c <= 0:  # Step is too large, Abort.
                 # print("c too small, aborting...")
                 for idx, w in enumerate(self.trust_model.parameters()):
                     w.data = prev_weights[idx]
                 gamma /= self.M_1
                 gamma = min(gamma, self.MAX_GAMMA)
                 if gamma == self.MAX_GAMMA:
-                    print("Epochs to Failure: {} Epochs to negative gradient: {}".format(steps_taken, steps_until_negative_grad_prod))
-                    return steps_taken 
+                   print("Epochs to Failure: {} Epochs to negative gradient: {}".format(steps_taken, steps_until_negative_grad_prod))
+                   return epoch
             else:
                 last_val_error = val_error
                 steps_taken += 1
@@ -325,7 +348,7 @@ class TrustRegionTester(object):
                 gamma = max(gamma, self.MIN_GAMMA)
             self.writer.add_scalar("trust_region/gamma", gamma, steps_taken)
         print("Epochs to Failure: {} Epochs to negative gradient: {}".format(steps_taken, steps_until_negative_grad_prod))
-        return steps_taken 
+        return steps_until_negative_grad_prod
 
     def train_normal(self):
         top_validation = 10**10
@@ -333,41 +356,47 @@ class TrustRegionTester(object):
         for epoch in range(self.epochs):
             predictions = self.model(self.train_data[self.DATA_IDX])
             error = self.loss_fn(predictions, self.train_data[self.GT_IDX])
+            if error.data < self.STOP_THRESH:
+                return epoch
             self.writer.add_scalar("normal/train", error.data, epoch)
             self.model.zero_grad()
             error.backward()
             for w in self.model.parameters():
                 w.data = w.data - self.lr * w.grad.data
 
-            val_error = self.run_validation(self.model)
+            val_error = self.test(self.model, self.val_data)
             self.writer.add_scalar("normal/val", val_error, epoch)
             if val_error < top_validation:
                 top_validation = val_error
                 top_model = self.model
         self.model = top_model
         print("top normal model validation: {}".format(top_validation))
+        return epoch
     
     def train_joint(self):
         top_validation = 10**10
         top_model = None
-        data = torch.cat([self.train_data[self.DATA_IDX], self.val_data[self.DATA_IDX]], axis=0)
-        gt = torch.cat([self.train_data[self.GT_IDX], self.val_data[self.GT_IDX]], axis=0)
+        data = torch.cat([self.train_data[self.DATA_IDX], self.val_data[self.DATA_IDX]], dim=0)
+        gt = torch.cat([self.train_data[self.GT_IDX], self.val_data[self.GT_IDX]], dim=0)
         for epoch in range(self.epochs):
             predictions = self.joint_model(data)
             error = self.loss_fn(predictions, gt)
-            self.writer.add_scalar("normal/train", error.data, epoch)
-            self.model.zero_grad()
+            if error.data < self.STOP_THRESH:
+                return epoch
+            self.writer.add_scalar("joint/train", error.data, epoch)
+            self.joint_model.zero_grad()
             error.backward()
-            for w in self.model.parameters():
+            for w in self.joint_model.parameters():
                 w.data = w.data - self.lr * w.grad.data
 
-            val_error = self.run_validation(self.model)
-            self.writer.add_scalar("normal/val", val_error, epoch)
+            val_error = self.test(self.joint_model, self.val_data)
+            self.writer.add_scalar("joint/val", val_error, epoch)
             if val_error < top_validation:
                 top_validation = val_error
-                top_model = self.model
-        self.model = top_model
-        print("top normal model validation: {}".format(top_validation))
+                top_model = self.joint_model
+        self.joint_model = top_model
+        print("top joint model validation: {}".format(top_validation))
+        return epoch
 
     def run_validation(self, model):
         model.zero_grad()
